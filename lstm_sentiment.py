@@ -1,20 +1,19 @@
 
 # coding: utf-8
 
-# In[24]:
-
+# In[105]:
 
 import pandas as pd
 import pickle
 import numpy as np
 import os
 from keras.models import Sequential, load_model, Model
-from keras.layers import Input, Dense, Dropout, Activation, Flatten
-from keras.layers import Embedding
+from keras.layers import Input, Dense, Dropout, Activation, Flatten, Embedding, Concatenate
 from keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
-from keras.layers import LSTM, Bidirectional, Convolution2D, MaxPooling2D
+from keras.layers import LSTM, Bidirectional, Convolution1D, Conv1D, AveragePooling1D, MaxPooling1D, GlobalMaxPooling1D
 from keras.preprocessing.sequence import pad_sequences
 from keras.utils import to_categorical
+from keras.optimizers import SGD
 
 from gensim.scripts.glove2word2vec import glove2word2vec 
 from gensim.models.keyedvectors import KeyedVectors
@@ -27,28 +26,24 @@ from nltk.corpus import stopwords
 from string import punctuation
 
 
-# In[2]:
-
+# In[5]:
 
 nltk.download('punkt')
 nltk.download('stopwords')
 
 
-# In[3]:
-
+# In[6]:
 
 path = "data/"
 GLOVE_DIR = "data/glove.twitter.27B/"
 
 
-# In[4]:
-
+# In[7]:
 
 input_dim = 100
 
 
-# In[5]:
-
+# In[8]:
 
 def ReadCSV(datafile, labelfile):
     inputdata = pd.io.parsers.read_csv(open(datafile, "r"),delimiter=",")
@@ -58,8 +53,7 @@ def ReadCSV(datafile, labelfile):
     return data, label
 
 
-# In[6]:
-
+# In[9]:
 
 def strip_punctuation(s):
     return ''.join(c for c in s if c not in punctuation)
@@ -114,23 +108,14 @@ def preprocessing(train_file): ## we will return everything as dictionaries
     return corpus_dict,affect_dict,intensity_dict
 
 
-# In[7]:
-
+# In[10]:
 
 def one_hot_encoding(y):
     y = to_categorical(y)
     return y[:,1:] #remove extra zero column at the first
 
 
-# In[8]:
-
-
-#def dict_to_array(dic):
-#    return [v for _, v in dic.items()]
-
-
-# In[9]:
-
+# In[11]:
 
 def prepare_data(data_file_name):
     data_path = path + data_file_name
@@ -158,23 +143,21 @@ def prepare_data(data_file_name):
     return (inputs, labels)    
 
 
-# In[10]:
-
+# In[13]:
 
 # convert glove to w2v
 glove_input_file = GLOVE_DIR + 'glove.twitter.27B.100d.txt'
 word2vec_output_file = GLOVE_DIR + 'word2vec.twitter.27B.100d.txt'
-"""
-glove2word2vec(glove_input_file, word2vec_output_file)
-print("Glove to Word2Vec conversion Done!")
-"""
+
+if not os.path.isfile(word2vec_output_file):
+    glove2word2vec(glove_input_file, word2vec_output_file)
+    print("Glove to Word2Vec conversion Done!")
 
 word2vec = KeyedVectors.load_word2vec_format(word2vec_output_file, binary=False)
 print("Load word2vec done!")
 
 
-# In[11]:
-
+# In[125]:
 
 # read data file
 train_data, train_label = prepare_data('EI-reg-En-full-train.csv')
@@ -186,26 +169,26 @@ print("Val:", len(dev_data), len(dev_label))
 print("Test:", len(test_data), len(test_label))
 
 
-# In[12]:
-
+# In[15]:
 
 input_data = np.concatenate((train_data, dev_data, test_data))
 max_sequence_length = max([len(x) for x in input_data])
 print("Max sequence length:", max_sequence_length)
 
 
-# In[13]:
-
+# In[16]:
 
 # embedding data
 def embedding(data, max_len):
-    data_eb = np.zeros((len(data), max_len, input_dim))
+    data_eb = [] #np.zeros((len(data), max_len, input_dim))
     for i in range(len(data)):
-        vec = []
+        row_eb = []
         for j, token in enumerate(data[i]):
             if token in word2vec:
-                data_eb[i][-len(data[i]) + j] = word2vec[token]            
-    return data_eb
+                #data_eb[i][-len(data[i]) + j] = word2vec[token]     
+                row_eb.append(word2vec[token])
+        data_eb.append(row_eb)
+    return pad_sequences(data_eb, maxlen=max_len)
 
 train_data = embedding(train_data, max_sequence_length)
 dev_data = embedding(dev_data, max_sequence_length)
@@ -216,8 +199,7 @@ print("Dev embedding:", dev_data.shape, dev_label.shape)
 print("Test embedding:", test_data.shape, test_label.shape)
 
 
-# In[14]:
-
+# In[129]:
 
 # convert label to one-hot vector
 labels = np.concatenate((train_label, dev_label, test_label))
@@ -232,10 +214,9 @@ test_label = y_oh[-test_label.shape[0]:]
 print("One-hot encoded:", train_label.shape, dev_label.shape, test_label.shape)
 
 
-# In[27]:
+# In[18]:
 
-
-def compile_model(input_dim, latent_dim, num_class):
+def compile_model_lstm(input_dim, latent_dim, num_class):
     '''Create model
 
     Args:
@@ -244,8 +225,8 @@ def compile_model(input_dim, latent_dim, num_class):
         num_class (int): number output class
     '''
     inputs = Input(shape=(None, input_dim))
-    lstm = Bidirectional(LSTM(latent_dim))(inputs)
-    drop = Dropout(0.5)(lstm)
+    lstm = LSTM(latent_dim)(inputs)
+    drop = Dropout(0.3)(lstm)
     #flat = Flatten()(drop)
     out = Dense(num_class, activation='softmax')(drop)
 
@@ -257,27 +238,190 @@ def compile_model(input_dim, latent_dim, num_class):
     return model
 
 
-# In[28]:
+# In[19]:
+
+def compile_model_bi_lstm(input_dim, latent_dim, num_class):
+    '''Create model
+
+    Args:
+        input_dim (int): dim of embedding vector (glove dimension)
+        latent_dim (int): dim of output from LSTM layer
+        num_class (int): number output class
+    '''
+    inputs = Input(shape=(None, input_dim))
+    lstm = Bidirectional(LSTM(latent_dim))(inputs)
+    drop = Dropout(0.5)(lstm)
+    out = Dense(num_class, activation='softmax')(drop)
+
+    model = Model(inputs, out)
+
+    model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+    model.summary()
+    
+    return model
 
 
-# create lstm model
-model = compile_model(input_dim, 128, number_classes)
+# In[102]:
+
+def compile_model_cnn(input_dim, max_len, num_class):
+    inputs = Input(shape=(max_len, input_dim), name='input', dtype='float32')
+    
+    conv = Convolution1D(256, kernel_size=3, padding='valid', activation='relu')(inputs)
+    conv = MaxPooling1D(pool_size=3)(conv)
+    
+    conv = Flatten()(conv)
+    conv = Dropout(0.2)(conv)
+    
+    # Dense
+    z = Dense(1024, activation='relu')(conv)
+    z = Dropout(0.5)(z)
+    
+    # Dense
+    z = Dense(1024, activation='relu')(conv)
+    z = Dropout(0.5)(z)
+    
+    # Output dense
+    out = Dense(num_class, activation='softmax')(z)
+    
+    model = Model(inputs, out)
+    sgd = SGD(lr=0.01, momentum=0.9)
+    model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+    model.summary()
+    
+    return model
 
 
-# In[29]:
+# In[103]:
+
+def compile_model_cnn_2(input_dim, max_len, num_class):
+    inputs = Input(shape=(max_len, input_dim), name='input', dtype='float32')
+    
+    filter_kernels = [5, 3, 3]
+    nb_filter = 256
+    convs = []
+    # Convolution
+    for fz in filter_kernels:
+        conv = Convolution1D(nb_filter, kernel_size=fz, padding='valid', activation='relu')(inputs)
+        pool = MaxPooling1D(pool_size=3)(conv)
+        flatten = Flatten()(pool)
+        convs.append(flatten)
+    
+    conv_out = Concatenate()(convs)
+
+    # Dense
+    z = Dense(1024, activation='relu')(conv_out)
+    z = Dropout(0.5)(z)
+    
+    # Dense
+    z = Dense(1024, activation='relu')(z)
+    z = Dropout(0.5)(z)
+    
+    # Output dense
+    out = Dense(num_class, activation='softmax')(z)
+    
+    model = Model(inputs, out)
+    sgd = SGD(lr=0.01, momentum=0.9)
+    model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=['accuracy'])
+    model.summary()
+    
+    return model
 
 
-epochs = 100
-batch_size = 128
+# In[52]:
 
-checkpointer = ModelCheckpoint(filepath='twitter-emotion.h5', verbose=1, save_best_only=True)
-model.fit(train_data, train_label, validation_data=(dev_data, dev_label), callbacks=[checkpointer], 
-          shuffle=True, epochs=epochs, batch_size=batch_size, verbose=2)
+def compile_model_cnn_lstm(input_dim, latent_dim, num_class):
+    inputs = Input(shape=(None, input_dim))
+    
+    conv = Convolution1D(256, kernel_size=3, padding='valid', activation='relu')(inputs)
+    conv = MaxPooling1D(pool_size=2)(conv)
+    
+    lstm = LSTM(latent_dim)(conv)
+    drop = Dropout(0.3)(lstm)
+    
+    out = Dense(num_class, activation='softmax')(drop)
+
+    model = Model(inputs, out)
+
+    model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+    model.summary()
+    
+    return model
 
 
-# In[24]:
+# In[110]:
+
+# Concat to train on both train + dev set, only validate on test set
+X_train = np.concatenate((train_data, dev_data))
+y_train = np.concatenate((train_label, dev_label))
+print("Training size:", X_train.shape)
+print("Test size:", test_data.shape)
 
 
-# test
-model.evaluate(test_data, test_label)
+# In[111]:
+
+def run_lstm(epochs=1, batch_size=128):
+    # create lstm model
+    model = compile_model_lstm(input_dim, 64, number_classes)
+
+    checkpointer = ModelCheckpoint(filepath='twitter-emotion-lstm.h5', verbose=1, save_best_only=True)
+    model.fit(X_train, y_train, validation_data=(test_data, test_label), callbacks=[checkpointer], 
+              shuffle=True, epochs=epochs, batch_size=batch_size, verbose=1)
+
+
+# In[112]:
+
+def run_bi_lstm(epochs=1, batch_size=128):
+    # create bi-lstm model
+    model = compile_model_bi_lstm(input_dim, 64, number_classes)
+
+    checkpointer = ModelCheckpoint(filepath='twitter-emotion-bi_lstm.h5', verbose=1, save_best_only=True)
+    model.fit(X_train, y_train, validation_data=(test_data, test_label), callbacks=[checkpointer], 
+              shuffle=True, epochs=epochs, batch_size=batch_size, verbose=1)
+
+
+# In[113]:
+
+def run_cnn_lstm(epochs=1, batch_size=128):
+    # create cnn-lstm model
+    model = compile_model_cnn_lstm(input_dim, 64, number_classes)
+
+    checkpointer = ModelCheckpoint(filepath='twitter-emotion-cnn-lstm.h5', verbose=1, save_best_only=True)
+    model.fit(X_train, y_train, validation_data=(test_data, test_label), callbacks=[checkpointer], 
+              shuffle=True, epochs=epochs, batch_size=batch_size, verbose=1)
+
+
+# In[114]:
+
+def run_cnn(epochs=1, batch_size=128):
+    # create cnn model
+    model = compile_model_cnn(input_dim, max_sequence_length, number_classes)
+
+    checkpointer = ModelCheckpoint(filepath='twitter-emotion-cnn.h5', verbose=1, save_best_only=True)
+    model.fit(X_train, y_train, validation_data=(test_data, test_label), callbacks=[checkpointer], 
+              shuffle=True, epochs=epochs, batch_size=batch_size, verbose=1)
+
+
+# In[115]:
+
+def run_cnn_2(epochs=1, batch_size=128):
+    # create cnn model
+    model = compile_model_cnn_2(input_dim, max_sequence_length, number_classes)
+
+    checkpointer = ModelCheckpoint(filepath='twitter-emotion-cnn_2.h5', verbose=1, save_best_only=True)
+    model.fit(X_train, y_train, validation_data=(test_data, test_label), callbacks=[checkpointer], 
+              shuffle=True, epochs=epochs, batch_size=batch_size, verbose=1)
+
+
+# In[117]:
+
+#run_lstm(10)
+run_bi_lstm(10)
+#run_cnn_lstm(10)
+#run_cnn(10)
+#run_cnn_2(10)
+
+
+# In[ ]:
+
+
 
